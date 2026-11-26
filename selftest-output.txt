@@ -1,0 +1,98 @@
+目标服务: http://127.0.0.1:8011
+健康检查通过: {'status': 'ok', 'journal_mode': 'wal', 'reset_enabled': True}
+
+=== A. 最大同时补齐数 / 确认 / 幂等重发 / 领料状态冲突 ===
+  PASS  候选样书 5 本
+  PASS  最大同时补齐数 = 4
+  PASS  恰好 1 本因争用未入选
+  PASS  版号不符散帖被诊断为 edition_mismatch
+  PASS  试配不扣余量（不占纸）
+  PASS  取帖单 A2 从缺页 3 起步
+  PASS  A2 帖 T34 与前段连续
+  PASS  A2 帖 T34 逐页版号相符
+  PASS  A2 帖 T56 与前段连续
+  PASS  A2 帖 T56 逐页版号相符
+  PASS  A2 连续接到末页 6
+  PASS  取帖单 A3 从缺页 3 起步
+  PASS  A3 帖 T36 与前段连续
+  PASS  A3 帖 T36 逐页版号相符
+  PASS  A3 连续接到末页 6
+  PASS  取帖单 A4 从缺页 3 起步
+  PASS  A4 帖 T36 与前段连续
+  PASS  A4 帖 T36 逐页版号相符
+  PASS  A4 连续接到末页 6
+  PASS  取帖单 A5 从缺页 5 起步
+  PASS  A5 帖 T56 与前段连续
+  PASS  A5 帖 T56 逐页版号相符
+  PASS  A5 连续接到末页 6
+  PASS  试配聚合用量不超过任何一垛的快照余量
+  PASS  入选集合为确定性的 A2,A3,A4,A5
+  PASS  同一时点重复试配结果稳定（同一最大流方案）
+  PASS  版号不符的取帖单被语义校验拒绝(422)
+  PASS  错误码 invalid_pick_list / edition_mismatch
+  PASS  确认方案返回 201
+  PASS  领料单号格式 LL-0001
+  PASS  replayed=false
+  PASS  扣料后余量正确（T12=2 未用,T34=0,T36=0,T56=0,BAD=3）
+  PASS  4 本入选样书均标记已领料，落选本仍可领
+  PASS  重发方案确认返回 200
+  PASS  重发返回同一张原领料单
+  PASS  重发原因 plan_already_confirmed
+  PASS  原样重发领料请求返回 200
+  PASS  指纹幂等返回原单且原因 same_plan
+  PASS  两次重发都没有二次扣料
+  PASS  含已领料样书的确认返回 409
+  PASS  错误码 samples_already_requisitioned
+  PASS  冲突后余量照旧
+  PASS  冲突后落选样书仍是 available
+  PASS  断链取帖单被语义校验拒绝(422)
+  PASS  错误码 invalid_pick_list / chain_not_continuous
+  PASS  A 组最终只有 1 张领料单
+  PASS  确认后再试配为 0 入选，落选原因 out_of_stock
+  PASS  重复 0 入选试配仍返回独立 plan_id
+  PASS  空方案确认被拒绝(422 empty_plan)
+  PASS  空方案拒绝后领料单仍只有 1 张
+
+=== B. 散帖争用并发确认（5 抢 2，败单整单退回）===
+  PASS  没有 5xx/网络错误
+  PASS  恰好 2 单确认成功(201)
+  PASS  恰好 3 单因余量冲突 409
+  PASS  3 个冲突全部是 insufficient_stock 且指向 X 垛
+  PASS  紧俏 X 垛余量为 0
+  PASS  充足 Y 垛只被扣掉 2 份（败单没有误扣 Y）=> 余量 3
+  PASS  恰好 2 本样书被标记已领料
+  PASS  服务端恰好 2 张领料单
+  PASS  Y 垛流水只有 2 条扣料且余额为 3
+
+=== C. 交错确认（样书重叠）与幂等并发重发 ===
+  PASS  交错序列 O1 先确认 -> 201
+  PASS  O2 含已被 O1 领料的 C2 -> 409
+  PASS  O2 错误码 samples_already_requisitioned
+  PASS  O3 与 O1 不共享样书 -> 201
+  PASS  重发 O1 -> 200 原单
+  PASS  P 垛仅按 O1(2本)+O3(2本) 扣 4 份 => 95
+  PASS  C1..C4 最终全部已领料（O2 整单退回，C3/C4 由 O3 领走）
+  PASS  并发交错只可能是 {O5} 或 {O4,O6} 成功（实际: {'O4', 'O6'}）
+  PASS  所有败因都是样书已领料（不是余量）
+  PASS  并发后样书领料集合与胜单并集完全一致
+  PASS  P 垛扣料数恰好等于胜单样书本数 => 余量 91
+  PASS  同 request_id 五连：恰好 1 个 201
+  PASS  同 request_id 五连：其余 4 个 200 重放
+  PASS  五连返回完全相同的领料单 ID
+  PASS  同方案指纹五连：恰好 1 个 201
+  PASS  同方案指纹五连：其余 4 个 200
+  PASS  指纹五连返回同一张单
+  PASS  两次幂等风暴总共只再扣 2 份 => P 余量 89
+
+=== D. 整单退回原子性（一垛不足，另一垛不得预扣）===
+  PASS  汇总余量不足 -> 409
+  PASS  错误码 insufficient_stock 且短缺垛为 Y(required=2,remaining=1)
+  PASS  整单退回：X 垛维持 2（没有先扣）
+  PASS  整单退回：Y 垛维持 1
+  PASS  两本样书都仍是 available
+  PASS  没有生成任何领料单
+
+====================================================================
+通过 83 项，失败 0 项
+全部自测通过 ✅
+SELFTEST_SUMMARY {"passed": 83, "failed": 0}

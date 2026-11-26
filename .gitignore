@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 本地裸跑产生的 SQLite 数据
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 临时/系统文件
+.DS_Store

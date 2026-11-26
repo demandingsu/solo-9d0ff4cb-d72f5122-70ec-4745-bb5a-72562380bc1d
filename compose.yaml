@@ -1,0 +1,38 @@
+services:
+  api:
+    build: .
+    image: signature-requisition-api:1.0.0
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/requisition.db
+      ENABLE_RESET: "1"   # 演示/自测环境开放 POST /api/admin/reset
+      AUTO_SEED: "1"      # 首次启动自动造一份争用演示数据
+    volumes:
+      - requisition-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+
+  # 可选：docker compose --profile selftest run --rm selftest
+  selftest:
+    build: .
+    image: signature-requisition-api:1.0.0
+    profiles: ["selftest"]
+    environment:
+      BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "selftest.py"]
+
+volumes:
+  requisition-data:
