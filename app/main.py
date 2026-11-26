@@ -27,6 +27,10 @@ from .schemas import (
     ConfirmResponse,
     PileBatchCreate,
     PileCreate,
+    QuarantineCreate,
+    QuarantineCreateResponse,
+    QuarantineDetail as QuarantineDetailModel,
+    QuarantineReleaseResponse,
     SampleBatchCreate,
     TrialRequest,
     TrialResult,
@@ -61,10 +65,13 @@ app = FastAPI(
         "装订员用散帖补齐样书的领料服务。\n\n"
         "- 录入：全书逐页目标版号、各本样书已配末页、各垛散帖的连续页码/逐页版号/份数\n"
         "- 试配：整帖取用、从缺页连续接到末页、逐页版号相符；用最大流求**最多能同时补齐**的样书与逐本取帖单\n"
-        "- 试配只读同一时点的余量与领料状态，**不占纸**\n"
+        "- 试配只读同一时点的余量与领料状态，**不占纸**；隔离中的垛整垛跳过\n"
+        "- 隔离：漏印后填垛号+原因开单，列出隔离前领到该垛帖的样书与原领料单号；"
+        "隔离期间含该垛的新单整单退回，余量照实显示\n"
         "- 确认：纸够且单上样书均未领料才整单扣料并标记；冲突整单退回\n"
         "- 幂等：同 request_id 或同方案指纹重发，返回原领料单\n\n"
-        "推荐演示：先调 `POST /api/demo/seed`，再依次试配、确认、重发。"
+        "推荐演示：先调 `POST /api/demo/seed`，再依次试配、确认、重发；"
+        "隔离另调 `POST /api/demo/quarantine/seed` 后按返回指引操作。"
     ),
 )
 
@@ -83,6 +90,13 @@ def root() -> dict[str, Any]:
             "POST /api/books/{book_id}/trial-matches",
             "POST /api/plans/{plan_id}/confirm",
             "POST /api/requisitions （直接确认；重发同方案返回原单）",
+            "POST /api/quarantines （漏印拦截：填 pile_id + reason）",
+            "POST /api/quarantines/{quarantine_no}/release （逐张解除）",
+        ],
+        "quarantine_demo": [
+            "POST /api/demo/quarantine/seed → 已领料后再开隔离单的演示数据",
+            "GET /api/quarantines → 查看隔离单与开单时领料名单",
+            "POST /api/quarantines/QZ-0001/release → 解除",
         ],
     }
 
@@ -207,7 +221,7 @@ def create_samples(
     return {"created_count": len(created), "samples": created}
 
 
-@app.get("/api/books/{book_id}/samples", tags=["基础录入"], summary="样书列表（含领料状态）")
+@app.get("/api/books/{book_id}/samples", tags=["基础录入"], summary="样书列表（含领料状态与仍生效的隔离单号）")
 def list_samples(book_id: int, conn: sqlite3.Connection = Depends(get_db)) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
@@ -219,7 +233,45 @@ def list_samples(book_id: int, conn: sqlite3.Connection = Depends(get_db)) -> li
         """,
         (book_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    # 该样书曾从哪些垛领过料；这些垛上仍生效的隔离单要标在样书上。
+    sample_piles: dict[int, list[int]] = {}
+    for r in conn.execute(
+        """
+        SELECT DISTINCT ri.sample_id, ri.pile_id
+        FROM requisition_items ri
+        JOIN samples s ON s.id = ri.sample_id
+        WHERE s.book_id = ?
+        """,
+        (book_id,),
+    ):
+        sample_piles.setdefault(int(r["sample_id"]), []).append(int(r["pile_id"]))
+    active_by_pile: dict[int, list[dict[str, Any]]] = {}
+    for q in conn.execute(
+        "SELECT id, pile_id, quarantine_no, reason, created_at FROM quarantine_orders "
+        "WHERE book_id = ? AND status = 'active' ORDER BY id",
+        (book_id,),
+    ):
+        active_by_pile.setdefault(int(q["pile_id"]), []).append(
+            {
+                "quarantine_id": q["id"],
+                "quarantine_no": q["quarantine_no"],
+                "reason": q["reason"],
+                "created_at": q["created_at"],
+            }
+        )
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        d = dict(row)
+        active = [
+            q
+            for pid in sample_piles.get(int(row["id"]), [])
+            for q in active_by_pile.get(pid, [])
+        ]
+        d["active_quarantines"] = active
+        d["active_quarantine_nos"] = [q["quarantine_no"] for q in active]
+        out.append(d)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -306,12 +358,25 @@ def create_piles_batch(
     return {"created_count": len(created), "piles": created}
 
 
-@app.get("/api/books/{book_id}/piles", tags=["基础录入"], summary="散帖垛列表（含当前余量）")
+@app.get("/api/books/{book_id}/piles", tags=["基础录入"], summary="散帖垛列表（含当前余量与生效隔离单号）")
 def list_piles(book_id: int, conn: sqlite3.Connection = Depends(get_db)) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT * FROM piles WHERE book_id = ? ORDER BY id", (book_id,)
     ).fetchall()
-    return [_pile_dict(r) for r in rows]
+    active_by_pile: dict[int, list[str]] = {}
+    for q in conn.execute(
+        "SELECT pile_id, quarantine_no FROM quarantine_orders "
+        "WHERE book_id = ? AND status = 'active' ORDER BY id",
+        (book_id,),
+    ):
+        active_by_pile.setdefault(int(q["pile_id"]), []).append(q["quarantine_no"])
+    out = []
+    for r in rows:
+        d = _pile_dict(r)
+        d["active_quarantine_nos"] = active_by_pile.get(int(r["id"]), [])
+        d["quarantined"] = bool(d["active_quarantine_nos"])
+        out.append(d)
+    return out
 
 
 @app.get("/api/piles/{pile_id}/movements", tags=["基础录入"], summary="某垛散帖的扣料流水")
@@ -333,7 +398,110 @@ def pile_movements(pile_id: int, conn: sqlite3.Connection = Depends(get_db)) -> 
             (pile_id,),
         )
     ]
-    return {"pile": _pile_dict(pile), "movements": movements}
+    detail = _pile_dict(pile)
+    detail["active_quarantine_nos"] = services._active_quarantine_nos(conn, pile_id)  # noqa: SLF001
+    return {"pile": detail, "movements": movements}
+
+
+# --------------------------------------------------------------------------- #
+# 隔离（漏印拦截）
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/api/quarantines",
+    status_code=201,
+    response_model=QuarantineCreateResponse,
+    tags=["隔离"],
+    summary="对一垛散帖开隔离单：列出隔离生效前领到该垛帖的样书与原领料单号",
+)
+def create_quarantine(
+    payload: QuarantineCreate, conn: sqlite3.Connection = Depends(get_db)
+) -> JSONResponse:
+    pile = conn.execute(
+        "SELECT book_id FROM piles WHERE id = ?", (payload.pile_id,)
+    ).fetchone()
+    if pile is None:
+        raise HTTPException(
+            404, detail={"code": "pile_not_found", "pile_id": payload.pile_id}
+        )
+    data = payload.model_dump()
+
+    def work(c: sqlite3.Connection) -> tuple[int, dict[str, Any]]:
+        return services.create_quarantine_in_tx(
+            c,
+            book_id=int(pile["book_id"]),
+            pile_id=data["pile_id"],
+            reason=data["reason"],
+            request_id=data.get("request_id"),
+        )
+
+    status_code, envelope = run_immediate(conn, work)
+    return JSONResponse(status_code=status_code, content=envelope)
+
+
+@app.get("/api/quarantines", tags=["隔离"], summary="隔离单列表（可按图书 / 隔离垛 / 状态过滤）")
+def list_quarantines(
+    book_id: int | None = None,
+    pile_id: int | None = None,
+    status: str | None = None,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> list[dict[str, Any]]:
+    where: list[str] = []
+    params: list[Any] = []
+    if book_id is not None:
+        where.append("book_id = ?")
+        params.append(book_id)
+    if pile_id is not None:
+        where.append("pile_id = ?")
+        params.append(pile_id)
+    if status is not None:
+        where.append("status = ?")
+        params.append(status)
+    sql = "SELECT id, quarantine_no, book_id, pile_id, reason, status, sample_count, request_id, created_at, released_at FROM quarantine_orders"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id"
+    return [dict(r) for r in conn.execute(sql, params)]
+
+
+@app.get(
+    "/api/quarantines/{quarantine_ref}",
+    response_model=QuarantineDetailModel,
+    tags=["隔离"],
+    summary="隔离单详情（含开单时的名单快照，解除后仍可回看）",
+)
+def get_quarantine(
+    quarantine_ref: str, conn: sqlite3.Connection = Depends(get_db)
+) -> dict[str, Any]:
+    row = None
+    if quarantine_ref.isdigit():
+        row = conn.execute(
+            "SELECT id FROM quarantine_orders WHERE id = ?", (int(quarantine_ref),)
+        ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT id FROM quarantine_orders WHERE quarantine_no = ?", (quarantine_ref,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(
+            404, detail={"code": "quarantine_not_found", "quarantine_ref": quarantine_ref}
+        )
+    return services.build_quarantine_detail(conn, int(row["id"]))
+
+
+@app.post(
+    "/api/quarantines/{quarantine_no}/release",
+    response_model=QuarantineReleaseResponse,
+    tags=["隔离"],
+    summary="解除一张隔离单；同一垛全部解除后才恢复领用（重复解除幂等）",
+)
+def release_quarantine(
+    quarantine_no: str, conn: sqlite3.Connection = Depends(get_db)
+) -> dict[str, Any]:
+    def work(c: sqlite3.Connection) -> tuple[dict[str, Any], bool]:
+        return services.release_quarantine_in_tx(c, quarantine_no)
+
+    detail, pile_released = run_immediate(conn, work)
+    return {"quarantine": detail, "pile_released": pile_released}
 
 
 # --------------------------------------------------------------------------- #
@@ -504,6 +672,18 @@ def demo_seed(conn: sqlite3.Connection = Depends(get_db)) -> dict[str, Any]:
     return seeded
 
 
+@app.post(
+    "/api/demo/quarantine/seed",
+    status_code=201,
+    tags=["演示"],
+    summary="造一份“已领料后发现漏印”的隔离演示（每次新建一本书）",
+)
+def demo_quarantine_seed(conn: sqlite3.Connection = Depends(get_db)) -> dict[str, Any]:
+    with transaction(conn, immediate=True):
+        seeded = services.seed_quarantine_demo(conn)
+    return seeded
+
+
 @app.post("/api/admin/reset", tags=["演示"], summary="清空全部数据（需 ENABLE_RESET=1）")
 def admin_reset(conn: sqlite3.Connection = Depends(get_db)) -> dict[str, Any]:
     if not ENABLE_RESET:
@@ -514,6 +694,8 @@ def admin_reset(conn: sqlite3.Connection = Depends(get_db)) -> dict[str, Any]:
     with transaction(conn, immediate=True):
         conn.execute("PRAGMA defer_foreign_keys = ON")
         for table in (
+            "quarantine_items",
+            "quarantine_orders",
             "stock_movements",
             "requisition_items",
             "requisition_orders",

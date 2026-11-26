@@ -97,9 +97,21 @@ def compute_trial(
     )
     piles_by_id = {p["id"]: p for p in pile_rows}
 
+    # 隔离中的垛：余量照实显示，但试配跳过（不进入最大流）。
+    active_quarantine_nos: dict[int, list[str]] = {}
+    for q in conn.execute(
+        "SELECT pile_id, quarantine_no FROM quarantine_orders "
+        "WHERE book_id = ? AND status = 'active' ORDER BY id",
+        (book_id,),
+    ):
+        active_quarantine_nos.setdefault(int(q["pile_id"]), []).append(
+            q["quarantine_no"]
+        )
+
     usable_piles: list[sqlite3.Row] = []
     diagnostics: list[dict[str, Any]] = []
     struct_adj: dict[int, list[int]] = {}
+    stocked_adj: dict[int, list[int]] = {}
     avail_adj: dict[int, list[int]] = {}
 
     for p in pile_rows:
@@ -108,6 +120,7 @@ def compute_trial(
         editions = json.loads(p["page_editions"])
         mismatched: list[int] = []
         reason: str | None = None
+        quarantined = p["id"] in active_quarantine_nos
 
         if end - start + 1 != len(editions):
             reason = "invalid_shape"
@@ -121,6 +134,9 @@ def compute_trial(
             ]
             if mismatched:
                 reason = "edition_mismatch"
+            elif quarantined:
+                # 结构上可用，但隔离期间整垛跳过。
+                reason = "quarantined"
 
         diagnostics.append(
             {
@@ -129,16 +145,30 @@ def compute_trial(
                 "usable": reason is None,
                 "reason": reason,
                 "mismatched_pages": mismatched,
+                "quarantined": quarantined,
+                "active_quarantine_nos": active_quarantine_nos.get(p["id"], []),
             }
         )
-        if reason is not None:
+
+        structurally_ok = (
+            end - start + 1 == len(editions)
+            and 1 <= start
+            and end <= n_pages
+            and not mismatched
+        )
+        if not structurally_ok:
             continue
 
-        usable_piles.append(p)
         next_page = end + 1
         struct_adj.setdefault(start, []).append(next_page)
         if int(p["copies_remaining"]) > 0:
-            avail_adj.setdefault(start, []).append(next_page)
+            stocked_adj.setdefault(start, []).append(next_page)
+            if not quarantined:
+                avail_adj.setdefault(start, []).append(next_page)
+
+        if quarantined:
+            continue
+        usable_piles.append(p)
 
     # 按领料状态/完成度分流。
     skipped: list[dict[str, Any]] = []
@@ -273,7 +303,8 @@ def compute_trial(
         if not reachable(struct_adj, start, target_node):
             reason = "no_valid_chain"
         elif not reachable(avail_adj, start, target_node):
-            reason = "out_of_stock"
+            # 有纸但唯一可走的路被隔离，与真的没纸区分开。
+            reason = "quarantined" if reachable(stocked_adj, start, target_node) else "out_of_stock"
         else:
             reason = "contention"
         unselected.append(
@@ -286,6 +317,8 @@ def compute_trial(
             "code": p["code"],
             "copies_total": p["copies_total"],
             "copies_remaining": p["copies_remaining"],
+            "quarantined": p["id"] in active_quarantine_nos,
+            "active_quarantine_nos": active_quarantine_nos.get(p["id"], []),
         }
         for p in pile_rows
     ]
@@ -442,6 +475,226 @@ def _replay_envelope(
     if order is None:
         raise RuntimeError(f"领料单 {order_row['id']} 缺少快照")
     return 200, {"replayed": True, "replay_reason": reason, "order": order}
+
+
+# --------------------------------------------------------------------------- #
+# 隔离单
+# --------------------------------------------------------------------------- #
+def _active_quarantine_nos(
+    conn: sqlite3.Connection, pile_id: int, *, exclude_id: int | None = None
+) -> list[str]:
+    if exclude_id is None:
+        rows = conn.execute(
+            "SELECT quarantine_no FROM quarantine_orders "
+            "WHERE pile_id = ? AND status = 'active' ORDER BY id",
+            (pile_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT quarantine_no FROM quarantine_orders "
+            "WHERE pile_id = ? AND status = 'active' AND id != ? ORDER BY id",
+            (pile_id, exclude_id),
+        ).fetchall()
+    return [r["quarantine_no"] for r in rows]
+
+
+def _quarantine_items(conn: sqlite3.Connection, quarantine_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT sample_id, sample_code, sample_bound_to_page,
+               requisition_order_id, requisition_order_no,
+               quantity, start_page, end_page
+        FROM quarantine_items
+        WHERE quarantine_id = ?
+        ORDER BY requisition_order_id, sample_id
+        """,
+        (quarantine_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def build_quarantine_detail(
+    conn: sqlite3.Connection, quarantine_id: int
+) -> dict[str, Any]:
+    q = conn.execute(
+        "SELECT * FROM quarantine_orders WHERE id = ?", (quarantine_id,)
+    ).fetchone()
+    if q is None:
+        raise RuntimeError(f"隔离单 {quarantine_id} 不存在")
+    pile = conn.execute("SELECT code FROM piles WHERE id = ?", (q["pile_id"],)).fetchone()
+    items = _quarantine_items(conn, quarantine_id)
+    others = (
+        _active_quarantine_nos(conn, int(q["pile_id"]), exclude_id=quarantine_id)
+        if q["status"] == "active"
+        else []
+    )
+    return {
+        "id": q["id"],
+        "quarantine_no": q["quarantine_no"],
+        "book_id": q["book_id"],
+        "pile_id": q["pile_id"],
+        "pile_code": pile["code"] if pile else str(q["pile_id"]),
+        "reason": q["reason"],
+        "status": q["status"],
+        "created_at": q["created_at"],
+        "released_at": q["released_at"],
+        "sample_count": q["sample_count"],
+        "request_id": q["request_id"],
+        "samples": items,
+        "pile_other_active_quarantine_nos": others,
+    }
+
+
+def _replay_quarantine_envelope(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> tuple[int, dict[str, Any]]:
+    # 名单是开单时写入 quarantine_items 的快照，重建时原样带出；
+    # 状态、同垛其他生效单号取当前值。
+    detail = build_quarantine_detail(conn, int(row["id"]))
+    return 200, {"replayed": True, "replay_reason": "request_id", "quarantine": detail}
+
+
+def create_quarantine_in_tx(
+    conn: sqlite3.Connection,
+    *,
+    book_id: int,
+    pile_id: int,
+    reason: str,
+    request_id: str | None,
+) -> tuple[int, dict[str, Any]]:
+    """开一张隔离单（必须运行在 BEGIN IMMEDIATE 事务体内）。
+
+    名单 = 隔离生效前（即本单提交之前）已从该垛领出过散帖的样书，
+    连同原领料单号一起写入 ``quarantine_items`` 作为不可变快照。
+    隔离与领料“以入账先后为准”：两者都在 BEGIN IMMEDIATE 串行化区间内，
+    先拿到写锁的那笔先生效；后到的领料单会看到隔离并整单退回。
+    """
+    if request_id:
+        row = conn.execute(
+            "SELECT * FROM quarantine_orders WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        if row is not None:
+            if int(row["pile_id"]) != pile_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "idempotency_key_conflict",
+                        "message": "相同 request_id 对应了不同的隔离垛",
+                        "request_id": request_id,
+                        "existing_quarantine_no": row["quarantine_no"],
+                    },
+                )
+            return _replay_quarantine_envelope(conn, row)
+
+    pile = conn.execute(
+        "SELECT * FROM piles WHERE id = ? AND book_id = ?", (pile_id, book_id)
+    ).fetchone()
+    if pile is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "pile_not_found", "pile_id": pile_id, "book_id": book_id},
+        )
+
+    now = utcnow_iso()
+    affected = conn.execute(
+        """
+        SELECT ri.sample_id, s.code AS sample_code, s.bound_to_page,
+               ri.order_id, o.order_no, ri.quantity, ri.start_page, ri.end_page
+        FROM requisition_items ri
+        JOIN requisition_orders o ON o.id = ri.order_id
+        JOIN samples s ON s.id = ri.sample_id
+        WHERE ri.pile_id = ?
+        ORDER BY ri.order_id, ri.sample_id
+        """,
+        (pile_id,),
+    ).fetchall()
+
+    cur = conn.execute(
+        """
+        INSERT INTO quarantine_orders
+            (quarantine_no, book_id, pile_id, reason, status,
+             sample_count, request_id, created_at)
+        VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+        """,
+        (
+            f"TMP-{uuid.uuid4().hex}",
+            book_id,
+            pile_id,
+            reason,
+            len({r["sample_id"] for r in affected}),
+            request_id,
+            now,
+        ),
+    )
+    quarantine_id = int(cur.lastrowid)
+    quarantine_no = f"QZ-{quarantine_id:04d}"
+    conn.execute(
+        "UPDATE quarantine_orders SET quarantine_no = ? WHERE id = ?",
+        (quarantine_no, quarantine_id),
+    )
+    for r in affected:
+        conn.execute(
+            """
+            INSERT INTO quarantine_items
+                (quarantine_id, sample_id, sample_code, sample_bound_to_page,
+                 requisition_order_id, requisition_order_no,
+                 quantity, start_page, end_page, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                quarantine_id,
+                r["sample_id"],
+                r["sample_code"],
+                r["bound_to_page"],
+                r["order_id"],
+                r["order_no"],
+                r["quantity"],
+                r["start_page"],
+                r["end_page"],
+                now,
+            ),
+        )
+
+    detail = build_quarantine_detail(conn, quarantine_id)
+    conn.execute(
+        "UPDATE quarantine_orders SET response_json = ? WHERE id = ?",
+        (json.dumps(detail, ensure_ascii=False), quarantine_id),
+    )
+    return 201, {"replayed": False, "replay_reason": None, "quarantine": detail}
+
+
+def release_quarantine_in_tx(
+    conn: sqlite3.Connection, quarantine_ref: str
+) -> tuple[dict[str, Any], bool]:
+    """逐张解除隔离单（必须运行在 BEGIN IMMEDIATE 事务体内）。
+
+    重复解除是幂等的（返回当前状态）。只有同一垛的隔离单全部解除后，
+    该垛才恢复领用 —— 由调用方据 ``pile_released`` 判断并展示。
+    """
+    row = None
+    if quarantine_ref.isdigit():
+        row = conn.execute(
+            "SELECT * FROM quarantine_orders WHERE id = ?", (int(quarantine_ref),)
+        ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT * FROM quarantine_orders WHERE quarantine_no = ?", (quarantine_ref,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "quarantine_not_found", "quarantine_ref": quarantine_ref},
+        )
+    if row["status"] == "active":
+        conn.execute(
+            "UPDATE quarantine_orders SET status = 'released', released_at = ? "
+            "WHERE id = ? AND status = 'active'",
+            (utcnow_iso(), row["id"]),
+        )
+        # 解除只改隔离单状态：不退还纸、不回滚领料，历史单据保持可审计。
+    detail = build_quarantine_detail(conn, int(row["id"]))
+    pile_still_active = bool(_active_quarantine_nos(conn, int(row["pile_id"])))
+    return detail, not pile_still_active
 
 
 # --------------------------------------------------------------------------- #
@@ -624,6 +877,34 @@ def create_order_in_tx(
         for it in pick["items"]:
             pid = int(it["pile_id"])
             need[pid] = need.get(pid, 0) + int(it.get("quantity", 1))
+
+    # 5b) 隔离检查：隔离期间，含隔离垛的新领料单整单退回。
+    #     余量不扣、样书状态不变；已确认的历史单重发由前面的幂等分支拦截，不受影响。
+    quarantined = []
+    for pid in sorted(need):
+        q_rows = conn.execute(
+            "SELECT quarantine_no, reason FROM quarantine_orders "
+            "WHERE pile_id = ? AND status = 'active' ORDER BY id",
+            (pid,),
+        ).fetchall()
+        if q_rows:
+            quarantined.append(
+                {
+                    "pile_id": pid,
+                    "pile_code": pile_by_id[pid]["code"],
+                    "quarantine_nos": [r["quarantine_no"] for r in q_rows],
+                    "reason": q_rows[0]["reason"],
+                }
+            )
+    if quarantined:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "pile_quarantined",
+                "message": "单上含隔离中的散帖垛，整单退回，余量与领料状态不变",
+                "quarantined_piles": quarantined,
+            },
+        )
 
     shortages = []
     for pid, required in sorted(need.items()):
@@ -830,5 +1111,101 @@ def seed_demo(conn: sqlite3.Connection) -> dict[str, Any]:
             "从响应复制 plan_id，POST /api/plans/{plan_id}/confirm",
             "再次 POST 同一地址，验证返回原领料单（replayed=true）",
             "GET /api/requisitions 查看全部领料单",
+            "POST /api/quarantines  body={\"pile_id\": <垛ID>, \"reason\": \"领出后发现漏印\"}",
+            "POST /api/quarantines/QZ-0001/release 解除隔离",
+        ],
+    }
+
+
+def seed_quarantine_demo(conn: sqlite3.Connection) -> dict[str, Any]:
+    """一键造“已领料后才发现漏印”的隔离演示：
+
+    * 先正常确认一张领料单，让 Q2 从 D-36 领走散帖、Q3 从 D-56 领走散帖；
+    * 再对 D-36 开隔离单，名单里就会出现 Q2 与原领料单号；
+    * 隔离期间 D-36 余量照实显示（剩 2 份），但试配跳过、含它的新单整单退回；
+    * 调用解除接口后恢复领用。
+
+    调用方需已处于 ``BEGIN IMMEDIATE`` 事务体内。
+    """
+    now = utcnow_iso()
+    cur = conn.execute(
+        "INSERT INTO books (title, page_count, created_at) VALUES (?, ?, ?)",
+        ("演示样书：领出后漏印隔离（6 页）", 6, now),
+    )
+    book_id = int(cur.lastrowid)
+    target = ["E1", "E1", "E2", "E2", "E3", "E3"]
+    for page_no, ed in enumerate(target, start=1):
+        conn.execute(
+            "INSERT INTO book_pages (book_id, page_no, edition_no) VALUES (?, ?, ?)",
+            (book_id, page_no, ed),
+        )
+
+    sample_ids: dict[str, int] = {}
+    for code, bound in [("Q1", 0), ("Q2", 2), ("Q3", 4), ("Q4", 4)]:
+        c = conn.execute(
+            "INSERT INTO samples (book_id, code, bound_to_page, status, created_at)"
+            " VALUES (?, ?, ?, 'available', ?)",
+            (book_id, code, bound, now),
+        )
+        sample_ids[code] = int(c.lastrowid)
+
+    pile_specs = [
+        ("D-12", 1, ["E1", "E1"], 2),
+        ("D-36", 3, ["E2", "E2", "E3", "E3"], 3),
+        ("D-56", 5, ["E3", "E3"], 2),
+    ]
+    pile_ids: dict[str, int] = {}
+    for code, start, eds, copies in pile_specs:
+        c = conn.execute(
+            """
+            INSERT INTO piles
+                (book_id, code, start_page, end_page, page_editions,
+                 copies_total, copies_remaining, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                book_id,
+                code,
+                start,
+                start + len(eds) - 1,
+                json.dumps(eds),
+                copies,
+                copies,
+                now,
+            ),
+        )
+        pile_ids[code] = int(c.lastrowid)
+
+    # 先正常领料：Q2 ← D-36，Q3 ← D-56。
+    picks = [
+        {"sample_id": sample_ids["Q2"], "items": [{"pile_id": pile_ids["D-36"]}]},
+        {"sample_id": sample_ids["Q3"], "items": [{"pile_id": pile_ids["D-56"]}]},
+    ]
+    fp = fingerprint_plan(book_id, picks)
+    _, order_envelope = create_order_in_tx(
+        conn, book_id=book_id, request_id=None, fingerprint=fp, picks=picks
+    )
+
+    # 再开隔离单：名单即上一单里领到 D-36 的 Q2（Q3 领的是 D-56，不在名单内）。
+    _, qz_envelope = create_quarantine_in_tx(
+        conn,
+        book_id=book_id,
+        pile_id=pile_ids["D-36"],
+        reason="领出后发现第 3 页漏印，装订前拦下",
+        request_id=None,
+    )
+
+    return {
+        "book_id": book_id,
+        "sample_ids": sample_ids,
+        "pile_ids": pile_ids,
+        "requisition_order": order_envelope["order"],
+        "quarantine": qz_envelope["quarantine"],
+        "next_steps": [
+            f"GET /api/books/{book_id}/samples 查看 Q2 上仍生效的隔离单号（Q3 领的是 D-56，不受影响）",
+            f"POST /api/books/{book_id}/trial-matches  body={{\"sample_ids\": []}}"
+            " → D-36 被跳过（pile_diagnostics.reason=quarantined）",
+            f"POST /api/quarantines/{qz_envelope['quarantine']['quarantine_no']}/release 解除",
+            "解除后再试配/领料即恢复；原已确认单仍可重发",
         ],
     }

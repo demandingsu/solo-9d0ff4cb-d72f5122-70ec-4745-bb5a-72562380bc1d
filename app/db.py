@@ -114,6 +114,48 @@ CREATE TABLE IF NOT EXISTS stock_movements (
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_movements_pile ON stock_movements(pile_id);
+
+-- 隔离单：散帖领出后发现漏印，质检在装订前拦下“已领到该垛帖”的样书。
+-- 隔离不扣余量（余量照实显示），只阻止隔离期间的新领料与试配。
+-- 同一垛可以同时存在多张隔离单，必须逐张解除；全部解除后才恢复领用。
+CREATE TABLE IF NOT EXISTS quarantine_orders (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    quarantine_no   TEXT NOT NULL UNIQUE,
+    book_id         INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    pile_id         INTEGER NOT NULL REFERENCES piles(id),
+    reason          TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'released')),
+    sample_count    INTEGER NOT NULL DEFAULT 0,
+    request_id      TEXT,
+    created_at      TEXT NOT NULL,
+    released_at     TEXT,
+    response_json   TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_quarantine_request_id
+    ON quarantine_orders(request_id) WHERE request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_quarantine_pile ON quarantine_orders(pile_id, status);
+CREATE INDEX IF NOT EXISTS idx_quarantine_book ON quarantine_orders(book_id);
+
+-- 开单时的名单快照：即使隔离单已解除、后续又产生了新单据，
+-- 回看旧隔离单仍能还原“隔离生效前领到这垛帖的样书 + 原领料单号”。
+CREATE TABLE IF NOT EXISTS quarantine_items (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    quarantine_id          INTEGER NOT NULL
+                               REFERENCES quarantine_orders(id) ON DELETE CASCADE,
+    sample_id              INTEGER NOT NULL REFERENCES samples(id),
+    sample_code            TEXT NOT NULL,
+    sample_bound_to_page   INTEGER NOT NULL,
+    requisition_order_id   INTEGER NOT NULL REFERENCES requisition_orders(id),
+    requisition_order_no   TEXT NOT NULL,
+    quantity               INTEGER NOT NULL,
+    start_page             INTEGER NOT NULL,
+    end_page               INTEGER NOT NULL,
+    created_at             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_qitems_quarantine ON quarantine_items(quarantine_id);
+CREATE INDEX IF NOT EXISTS idx_qitems_sample ON quarantine_items(sample_id);
+CREATE INDEX IF NOT EXISTS idx_qitems_order ON quarantine_items(requisition_order_id);
 """
 
 

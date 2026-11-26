@@ -174,6 +174,23 @@ def order_count(book_id: int) -> int:
     return len(body)
 
 
+def quarantine(pile_id: int, reason: str, request_id: str | None = None):
+    body: dict[str, Any] = {"pile_id": pile_id, "reason": reason}
+    if request_id is not None:
+        body["request_id"] = request_id
+    return request("POST", "/api/quarantines", body)
+
+
+def release(quarantine_ref: str):
+    return request("POST", f"/api/quarantines/{quarantine_ref}/release")
+
+
+def quarantine_detail(ref: str):
+    status, body = request("GET", f"/api/quarantines/{ref}")
+    assert status == 200, (status, body)
+    return body
+
+
 def run_concurrent(n: int, fn: Callable[[Barrier, int], Any]) -> list[Any]:
     barrier = Barrier(n)
     from concurrent.futures import ThreadPoolExecutor
@@ -622,6 +639,359 @@ def group_d() -> None:
     check("没有生成任何领料单", order_count(book) == 0, order_count(book))
 
 
+# --------------------------------------------------------------------------- #
+# E. 隔离：开单名单、试配跳过、新单退回、逐张解除、旧单回看
+# --------------------------------------------------------------------------- #
+def group_e() -> None:
+    print("\n=== E. 隔离开单 / 试配跳过 / 整单退回 / 逐张解除 ===")
+    reset()
+    target = ["E1", "E1", "E2", "E2", "E3", "E3"]
+    book = make_book(target, "E-漏印隔离")
+    smap = add_samples(book, [("Q1", 0), ("Q2", 2), ("Q3", 4), ("Q4", 4)])
+    d12 = add_pile(book, "D-12", 1, ["E1", "E1"], 2)
+    d36 = add_pile(book, "D-36", 3, ["E2", "E2", "E3", "E3"], 3)
+    d56 = add_pile(book, "D-56", 5, ["E3", "E3"], 2)
+
+    # 先正常领料：Q2 ← D-36；Q3 ← D-56。
+    s_ok, b_ok = confirm(
+        confirm_body(book, [(smap["Q2"], [d36]), (smap["Q3"], [d56])])
+    )
+    check("隔离前正常领料 -> 201", s_ok == 201, (s_ok, b_ok))
+    order1_no = b_ok["order"]["order_no"]
+    stock_before = {pid: p["copies_remaining"] for pid, p in piles_map(book).items()}
+    check(
+        "领料后余量 D-12=2,D-36=2,D-56=1",
+        stock_before == {d12: 2, d36: 2, d56: 1},
+        stock_before,
+    )
+
+    # 开隔离单：名单应列出 Q2 与原领料单号。
+    status, qz = quarantine(d36, "领出后发现第 3 页漏印，装订前拦下")
+    check("开隔离单 -> 201", status == 201, (status, qz))
+    q1 = qz["quarantine"]
+    check("隔离单号格式 QZ-0001", q1["quarantine_no"] == "QZ-0001", q1["quarantine_no"])
+    check("隔离单状态 active", q1["status"] == "active", q1["status"])
+    check(
+        "名单含隔离前领到 D-36 的 Q2 与原单号",
+        [(s["sample_code"], s["requisition_order_no"]) for s in q1["samples"]]
+        == [("Q2", order1_no)],
+        q1["samples"],
+    )
+    check("名单条数 sample_count=1", q1["sample_count"] == 1, q1["sample_count"])
+
+    # 隔离不扣余量，余量照实显示。
+    stock_after_q = {pid: p["copies_remaining"] for pid, p in piles_map(book).items()}
+    check("隔离不扣纸，余量照实显示", stock_after_q == stock_before, stock_after_q)
+    mov_status, mov = request("GET", f"/api/piles/{d36}/movements")
+    check(
+        "D-36 流水仍只有原领料的 1 条，隔离不产生扣料",
+        mov_status == 200 and len(mov["movements"]) == 1,
+        mov,
+    )
+
+    # 样书列表标出仍生效的隔离单号，其他样书不受影响。
+    status, samples = request("GET", f"/api/books/{book}/samples")
+    by_code = {s["code"]: s for s in samples}
+    check(
+        "Q2 样书标出仍生效的隔离单号 QZ-0001",
+        by_code["Q2"]["active_quarantine_nos"] == ["QZ-0001"],
+        by_code["Q2"].get("active_quarantine_nos"),
+    )
+    check(
+        "Q3（领的是 D-56）不受该隔离影响",
+        by_code["Q3"]["active_quarantine_nos"] == [],
+        by_code["Q3"].get("active_quarantine_nos"),
+    )
+
+    # 隔离期间试配跳过这垛，其他垛照常。
+    result = trial(book)
+    check(
+        "试配跳过隔离中的 D-36",
+        all(
+            item["pile_id"] != d36
+            for pl in result["pick_lists"]
+            for item in pl["items"]
+        ),
+        result["pick_lists"],
+    )
+    diag = {d["pile_id"]: d for d in result["pile_diagnostics"]}
+    check(
+        "D-36 诊断 reason=quarantined",
+        diag[d36]["reason"] == "quarantined" and diag[d36]["usable"] is False,
+        diag[d36],
+    )
+    check(
+        "D-12/D-56 仍可用（其他垛照常）",
+        diag[d12]["usable"] is True and diag[d56]["usable"] is True,
+        diag,
+    )
+    snap = {s["pile_id"]: s for s in result["stock_snapshot"]}
+    check(
+        "库存快照中 D-36 余量照实=2 且标 quarantined",
+        snap[d36]["copies_remaining"] == 2 and snap[d36]["quarantined"] is True,
+        snap[d36],
+    )
+    q1_unsel = [u for u in result["unselected_samples"] if u["sample_id"] == smap["Q1"]]
+    check(
+        "需要经过隔离垛的 Q1 落选原因为 quarantined",
+        bool(q1_unsel) and q1_unsel[0]["reason"] == "quarantined",
+        result["unselected_samples"],
+    )
+    # 其余样书若能在别的垛上配齐，应照常入选。
+    trial_piles = {item["pile_id"] for pl in result["pick_lists"] for item in pl["items"]}
+    check(
+        "试配只用了非隔离垛",
+        trial_piles <= {d12, d56},
+        trial_piles,
+    )
+
+    # 直接提交含隔离垛的新单 -> 409 整单退回。
+    body_new = confirm_body(book, [(smap["Q1"], [d12, d36])])
+    status, resp = confirm(body_new)
+    check("含隔离垛的新领料单 -> 409", status == 409, (status, resp))
+    check(
+        "错误码 pile_quarantined 且指向 QZ-0001",
+        resp["detail"]["code"] == "pile_quarantined"
+        and resp["detail"]["quarantined_piles"][0]["quarantine_nos"] == ["QZ-0001"],
+        resp.get("detail"),
+    )
+    check(
+        "整单退回后余量不变",
+        {pid: p["copies_remaining"] for pid, p in piles_map(book).items()}
+        == stock_before,
+    )
+    check(
+        "整单退回后 Q1 仍 available",
+        sample_status_map(book)[smap["Q1"]] == "available",
+    )
+
+    # 确认试配方案也整单退回：用隔离前生成、含 D-36 的方案。
+    status, plan_qz = quarantine(d56, "另一垛隔离：为验证确认方案被退回")
+    check("第二张隔离单（D-56）开单成功", status == 201, (status, plan_qz))
+    qz_d56_no = plan_qz["quarantine"]["quarantine_no"]
+    # 为拿到一个“含隔离垛”的 plan，先解除 D-36 隔离生成方案，再重新隔离后确认。
+    release(q1["quarantine_no"])
+    trial_for_plan = trial(book)
+    plan_has_d36 = any(
+        item["pile_id"] == d36
+        for pl in trial_for_plan["pick_lists"]
+        for item in pl["items"]
+    )
+    check(
+        "（构造）解除 D-36 后试配方案重新用到 D-36",
+        plan_has_d36,
+        trial_for_plan["pick_lists"],
+    )
+    status, qz_again = quarantine(d36, "复核仍未通过，重新隔离")
+    check("重新隔离 D-36 -> 201", status == 201, (status, qz_again))
+    qz_again_no = qz_again["quarantine"]["quarantine_no"]
+    status, conf_resp = confirm_plan(trial_for_plan["plan_id"])
+    check("确认含隔离垛的试配方案 -> 409", status == 409, (status, conf_resp))
+    check(
+        "确认方案退回错误码 pile_quarantined",
+        status == 409 and conf_resp.get("detail", {}).get("code") == "pile_quarantined",
+        conf_resp.get("detail"),
+    )
+
+    # 已确认的原单仍可重发（隔离不影响历史单）。
+    status, replay_resp = confirm(
+        confirm_body(book, [(smap["Q2"], [d36]), (smap["Q3"], [d56])])
+    )
+    check(
+        "已确认的原单在隔离期间仍可原样重发 -> 200 原单",
+        status == 200
+        and replay_resp["replayed"] is True
+        and replay_resp["order"]["order_no"] == order1_no,
+        (status, replay_resp),
+    )
+
+    # 同一垛两张隔离单：逐张解除，全部解除前不能领用。
+    status, qz_b = quarantine(d36, "同垛第二张隔离单")
+    qz_b_no = qz_b["quarantine"]["quarantine_no"]
+    check("同垛可同时存在两张隔离单", status == 201, (status, qz_b))
+    check(
+        "第二张单上显示同垛其他生效单号",
+        qz_b["quarantine"]["pile_other_active_quarantine_nos"] == [qz_again_no],
+        qz_b["quarantine"]["pile_other_active_quarantine_nos"],
+    )
+
+    status, rel_a = release(qz_again_no)
+    check(
+        "解除第一张 -> pile_released=false（仍有其他隔离单）",
+        status == 200 and rel_a["quarantine"]["status"] == "released"
+        and rel_a["pile_released"] is False,
+        (status, rel_a),
+    )
+    status, still_blocked = confirm(confirm_body(book, [(smap["Q1"], [d12, d36])]))
+    check(
+        "只解除一张时含 D-36 的新单仍 409",
+        status == 409
+        and still_blocked["detail"]["quarantined_piles"][0]["quarantine_nos"]
+        == [qz_b_no],
+        (status, still_blocked),
+    )
+    status, rel_b = release(qz_b_no)
+    check(
+        "解除最后一张 -> pile_released=true",
+        status == 200 and rel_b["pile_released"] is True,
+        (status, rel_b),
+    )
+
+    # D-56 仍有一张隔离单，验证“其他垛”和“逐垛独立”。解除它后全部恢复。
+    rel_d56 = release(qz_d56_no)
+    check("解除 D-56 的隔离单 -> pile_released=true", rel_d56[1]["pile_released"] is True)
+
+    status, ok_after = confirm(confirm_body(book, [(smap["Q1"], [d12, d36])]))
+    check("同一垛全部解除后恢复领用 -> 201", status == 201, (status, ok_after))
+
+    # 查旧隔离单：仍能看到开单时的名单，即使后来又有了新单。
+    detail_a = quarantine_detail(qz_again_no)
+    check(
+        "旧隔离单可回看，状态已解除且名单不变",
+        detail_a["status"] == "released"
+        and [(s["sample_code"], s["requisition_order_no"]) for s in detail_a["samples"]]
+        == [("Q2", order1_no)],
+        detail_a,
+    )
+    detail_orig = quarantine_detail(q1["quarantine_no"])
+    check(
+        "开单时名单不含隔离后新领的样书（快照不随后续变化）",
+        all(s["sample_code"] != "Q1" for s in detail_orig["samples"]),
+        detail_orig["samples"],
+    )
+    # 解除是幂等的。
+    status, rel_again = release(qz_again_no)
+    check(
+        "重复解除同一张隔离单幂等 -> 200 released",
+        status == 200 and rel_again["quarantine"]["status"] == "released",
+        (status, rel_again),
+    )
+    status, not_found = release("QZ-9999")
+    check("解除不存在的隔离单 -> 404", status == 404, (status, not_found))
+
+
+# --------------------------------------------------------------------------- #
+# F. 隔离与领料交错入账：先拿到写锁的一笔先生效
+# --------------------------------------------------------------------------- #
+def group_f() -> None:
+    print("\n=== F. 隔离与领料交错入账（以入账先后为准）===")
+    reset()
+    book = make_book(["E", "E"], "F-交错入账")
+    sids = add_samples(book, [(f"F{i}", 0) for i in range(1, 11)])
+    p = add_pile(book, "P-12", 1, ["E", "E"], 99)
+
+    # 场景 1：领料先入账，隔离后入账 -> 领料成功，隔离单名单包含该样书。
+    status, order = confirm(confirm_body(book, [(sids["F1"], [p])]))
+    check("交错场景1：领料先提交 -> 201", status == 201, (status, order))
+    status, qz = quarantine(p, "领出后发现漏印（场景1）")
+    check("交错场景1：随后开隔离单 -> 201", status == 201, (status, qz))
+    check(
+        "交错场景1：隔离单名单含刚领料的 F1",
+        [s["sample_code"] for s in qz["quarantine"]["samples"]] == ["F1"],
+        qz["quarantine"]["samples"],
+    )
+    release(qz["quarantine"]["quarantine_no"])
+
+    # 场景 2：隔离先入账，领料后提交 -> 领料整单退回。
+    status, qz2 = quarantine(p, "隔离先入账（场景2）")
+    check("交错场景2：先开隔离单 -> 201", status == 201, (status, qz2))
+    status, blocked = confirm(confirm_body(book, [(sids["F2"], [p])]))
+    check(
+        "交错场景2：隔离生效后领料 -> 409 整单退回",
+        status == 409 and blocked["detail"]["code"] == "pile_quarantined",
+        (status, blocked),
+    )
+    check("交错场景2：败单没有标记样书", sample_status_map(book)[sids["F2"]] == "available")
+    check(
+        "交错场景2：余量仍只被场景1扣 1 份 => 98",
+        piles_map(book)[p]["copies_remaining"] == 98,
+        piles_map(book)[p]["copies_remaining"],
+    )
+    release(qz2["quarantine"]["quarantine_no"])
+
+    # 场景 3：并发同时提交。硬性校验每轮不变量：“领料 201 ⇒ 隔离名单含它”
+    # 或“领料 409 ⇒ 隔离名单不含它”，不允许出现两边都成功却漏登记，
+    # 也不允许两边都失败（纸被白扣）。谁先入账由 SQLite 写锁决定，属调度结果；
+    # 场景 1/2 已确定性地各覆盖一种先后，这里只打印分布供参考，不作硬断言。
+    import random
+    import time
+
+    outcomes_seen: list[str] = []
+    for idx in range(3, 11):
+        sid = sids[f"F{idx}"]
+        assert not [
+            q
+            for q in request("GET", f"/api/quarantines?pile_id={p}&status=active")[1]
+        ], "并发轮次开始前不应有生效隔离"
+
+        # 微小随机抖动让两种先后都自然出现，同时仍是真实并发。
+        delay_conf = random.uniform(0, 0.008)
+        delay_qz = random.uniform(0, 0.008)
+
+        def conf_task(barrier: Barrier, _i: int, _sid: int = sid, _d: float = delay_conf):
+            barrier.wait()
+            time.sleep(_d)
+            return confirm(confirm_body(book, [(_sid, [p])]))
+
+        def qz_task(barrier: Barrier, _i: int, _tag: int = idx, _d: float = delay_qz):
+            barrier.wait()
+            time.sleep(_d)
+            return quarantine(p, f"并发隔离-{_tag}", request_id=f"race-qz-{_tag}")
+
+        barrier = Barrier(2)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_conf = pool.submit(conf_task, barrier, 0)
+            fut_qz = pool.submit(qz_task, barrier, 0)
+            c_status, c_body = fut_conf.result(timeout=60)
+            q_status, q_body = fut_qz.result(timeout=60)
+
+        q_no = q_body["quarantine"]["quarantine_no"]
+        listed = any(
+            s["sample_code"] == f"F{idx}" for s in q_body["quarantine"]["samples"]
+        )
+        if c_status == 201:
+            outcomes_seen.append("领料先")
+            check(
+                f"并发交错 {idx}：领料先入账 -> 隔离单名单必然含该样书",
+                q_status == 201 and listed,
+                (c_status, q_status, q_body.get("quarantine", {}).get("samples")),
+            )
+        else:
+            outcomes_seen.append("隔离先")
+            check(
+                f"并发交错 {idx}：隔离先入账 -> 领料 409 且名单不含该样书",
+                c_status == 409
+                and c_body["detail"]["code"] == "pile_quarantined"
+                and q_status == 201
+                and not listed,
+                (c_status, c_body.get("detail"), q_status),
+            )
+        release(q_no)
+
+    print(
+        "  信息  并发轮次入账先后分布: "
+        f"领料先 {outcomes_seen.count('领料先')} 次 / 隔离先 {outcomes_seen.count('隔离先')} 次"
+    )
+    check(
+        "交错结束后没有生效中的隔离单",
+        request("GET", f"/api/quarantines?pile_id={p}&status=active")[1] == [],
+    )
+
+    # 场景 4：同一 request_id 的隔离单重发返回原单。
+    status, qz_r1 = quarantine(p, "幂等开单", request_id="qz-idem-1")
+    status2, qz_r2 = quarantine(p, "幂等开单", request_id="qz-idem-1")
+    check(
+        "同 request_id 重发隔离单 -> 200 原单",
+        status == 201
+        and status2 == 200
+        and qz_r2["replayed"] is True
+        and qz_r2["quarantine"]["quarantine_no"] == qz_r1["quarantine"]["quarantine_no"],
+        (status, status2, qz_r2),
+    )
+
+
 def main() -> int:
     print(f"目标服务: {BASE}")
     wait_health()
@@ -629,6 +999,8 @@ def main() -> int:
     group_b()
     group_c()
     group_d()
+    group_e()
+    group_f()
     print("\n" + "=" * 68)
     print(f"通过 {_passed} 项，失败 {_failed} 项")
     if _failed:

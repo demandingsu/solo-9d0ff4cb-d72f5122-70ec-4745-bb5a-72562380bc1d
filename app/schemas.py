@@ -131,8 +131,8 @@ class UnselectedSample(BaseModel):
     bound_to_page: int
     reason: str = Field(
         ...,
-        description="no_valid_chain=无版号相符的连续帖链；out_of_stock=当前余量下单独也配不齐；"
-        "contention=单独可配但在本批最大同时方案中被争用挤掉",
+        description="no_valid_chain=无版号相符的连续帖链；quarantined=唯一可用帖链经过隔离中的垛；"
+        "out_of_stock=当前余量下单独也配不齐；contention=单独可配但在本批最大同时方案中被争用挤掉",
     )
 
 
@@ -140,15 +140,21 @@ class StockSnapshotItem(BaseModel):
     pile_id: int
     code: str
     copies_total: int
-    copies_remaining: int
+    copies_remaining: int = Field(..., description="实际余量；隔离不扣纸，照实显示")
+    quarantined: bool = Field(False, description="该垛当前是否有生效中的隔离单（试配会跳过）")
+    active_quarantine_nos: list[str] = Field(default_factory=list)
 
 
 class PileDiagnostic(BaseModel):
     pile_id: int
     code: str
     usable: bool
-    reason: str | None = None
+    reason: str | None = Field(
+        None, description="invalid_shape / page_out_of_range / edition_mismatch / quarantined"
+    )
     mismatched_pages: list[int] = Field(default_factory=list)
+    quarantined: bool = False
+    active_quarantine_nos: list[str] = Field(default_factory=list)
 
 
 class ConfirmItemIn(BaseModel):
@@ -246,3 +252,73 @@ class ConfirmResponse(BaseModel):
     replayed: bool = False
     replay_reason: str | None = None
     order: OrderDetail
+
+
+# --------------------------------------------------------------------------- #
+# 隔离单
+# --------------------------------------------------------------------------- #
+class QuarantineCreate(BaseModel):
+    pile_id: int = Field(..., description="发现漏印的散帖垛 ID")
+    reason: str = Field(
+        ..., min_length=1, max_length=500, description="隔离原因，例如“领出后发现漏印”"
+    )
+    request_id: str | None = Field(
+        None, max_length=120, description="可选客户端幂等号；同号重发返回原隔离单"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "pile_id": 3,
+                "reason": "领出后发现第 3 页漏印，装订前拦下",
+                "request_id": "可选-质检开单号-0001",
+            }
+        }
+    }
+
+
+class QuarantineSampleItem(BaseModel):
+    sample_id: int
+    sample_code: str
+    sample_bound_to_page: int
+    requisition_order_id: int
+    requisition_order_no: str
+    quantity: int
+    start_page: int
+    end_page: int
+
+
+class QuarantineDetail(BaseModel):
+    id: int
+    quarantine_no: str
+    book_id: int
+    pile_id: int
+    pile_code: str
+    reason: str
+    status: str = Field(..., description="active=隔离生效中；released=已解除")
+    created_at: str
+    released_at: str | None
+    sample_count: int
+    request_id: str | None
+    samples: list[QuarantineSampleItem] = Field(
+        ...,
+        description="开单时（隔离生效前）已从该垛领料的样书及其原领料单号；"
+        "这是开单时点的名单快照，回看旧单不受后续单据影响",
+    )
+    pile_other_active_quarantine_nos: list[str] = Field(
+        default_factory=list,
+        description="同一垛上除本单以外仍生效的其他隔离单号；为空且本单生效时才恢复领用",
+    )
+
+
+class QuarantineCreateResponse(BaseModel):
+    replayed: bool = False
+    replay_reason: str | None = None
+    quarantine: QuarantineDetail
+
+
+class QuarantineReleaseResponse(BaseModel):
+    quarantine: QuarantineDetail
+    pile_released: bool = Field(
+        ..., description="true=该垛已无生效隔离单，恢复领用；false=仍有其他隔离单生效"
+    )
